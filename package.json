@@ -1,0 +1,14 @@
+{
+  "name": "snapbridge-monorepo",
+  "private": true,
+  "workspaces": [
+    "shared",
+    "desktop",
+    "mobile"
+  ],
+  "scripts": {
+    "shared:build": "npm run build -w shared",
+    "desktop:build": "npm run build -w desktop",
+    "mobile:start": "npm run start -w mobile"
+  }
+}

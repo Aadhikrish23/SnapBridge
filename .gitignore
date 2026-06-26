@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+bin/
+out/
+*.gemini/
+
+# SQLite databases and local data
+*.db
+*.db-journal
+*.db-wal
+logs/
+*.log
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Android specific
+.gradle/
+local.properties
+*.apk
+*.aar
+*.keystore
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+node_modules/
+dist/
+build/
+.gradle/
+android/.gradle/
+android/app/build/
+ios/build/
