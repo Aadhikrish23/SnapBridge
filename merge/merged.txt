@@ -1,0 +1,2460 @@
+// File: e:\SnapBridge\mobile\src\hooks\useConfig.ts
+import { useState, useCallback } from 'react';
+import { MobileConfig } from '../types';
+import { ServiceProvider } from '../services/ServiceProvider';
+
+export function useConfig() {
+  const [config, setConfig] = useState<MobileConfig>(() => ServiceProvider.storage.loadConfig());
+
+  const updateConfig = useCallback((partial: Partial<MobileConfig>) => {
+    const updated = ServiceProvider.storage.updateConfig(partial);
+    setConfig(updated);
+    return updated;
+  }, []);
+
+  const reloadConfig = useCallback(() => {
+    const loaded = ServiceProvider.storage.loadConfig();
+    setConfig(loaded);
+    return loaded;
+  }, []);
+
+  return { config, updateConfig, reloadConfig };
+}
+
+
+// File: e:\SnapBridge\mobile\src\navigation\AppNavigator.tsx
+import React from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import type { RootStackParamList } from './types';
+import { CameraScreen } from '../screens/CameraScreen';
+import { PreviewScreen } from '../screens/PreviewScreen';
+import { SettingsScreen } from '../screens/SettingsScreen';
+import { QrScannerScreen } from '../screens/QrScannerScreen';
+import { Colors } from '../theme';
+
+const Stack = createNativeStackNavigator<RootStackParamList>();
+
+export function AppNavigator(): React.JSX.Element {
+  return (
+    <NavigationContainer>
+      <Stack.Navigator
+        initialRouteName="Camera"
+        screenOptions={{
+          headerShown: false,
+          contentStyle: { backgroundColor: Colors.background },
+          animation: 'slide_from_right',
+        }}>
+        <Stack.Screen name="Camera" component={CameraScreen} />
+        <Stack.Screen name="Preview" component={PreviewScreen} />
+        <Stack.Screen
+          name="Settings"
+          component={SettingsScreen}
+          options={{ animation: 'slide_from_bottom' }}
+        />
+        <Stack.Screen
+          name="QrScanner"
+          component={QrScannerScreen}
+          options={{ animation: 'slide_from_bottom' }}
+        />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+
+
+// File: e:\SnapBridge\mobile\src\navigation\types.ts
+import type { CapturedImage } from '../types';
+
+export type RootStackParamList = {
+  Camera: undefined;
+  Preview: { image: CapturedImage };
+  Settings: undefined;
+  QrScanner: undefined;
+};
+
+
+// File: e:\SnapBridge\mobile\src\screens\CameraScreen.tsx
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  ActivityIndicator,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useIsFocused } from '@react-navigation/native';
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import type { RootStackParamList } from '../navigation/types';
+import { ServiceProvider } from '../services/ServiceProvider';
+import { useConfig } from '../hooks/useConfig';
+import { Colors, Spacing, FontSize, BorderRadius } from '../theme';
+import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
+import { CapturedImage } from '../types';
+
+type Props = NativeStackScreenProps<RootStackParamList, 'Camera'>;
+
+export function CameraScreen({ navigation }: Props): React.JSX.Element {
+  const insets = useSafeAreaInsets();
+  const isFocused = useIsFocused();
+  const { config, updateConfig } = useConfig();
+
+  const cameraRef = useRef<Camera>(null);
+  const device = useCameraDevice('back');
+  const { hasPermission, requestPermission } = useCameraPermission();
+
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [flashMode, setFlashMode] = useState<'on' | 'off'>('off');
+  const [connectionState, setConnectionState] = useState<'Connected' | 'Discovering' | 'Offline'>('Offline');
+  const [pendingImage, setPendingImage] = useState<CapturedImage | null>(null);
+  const [isRetrying, setIsRetrying] = useState(false);
+
+  const isPaired = config.pairedDesktopName !== null;
+
+  // 1. Refresh pending upload state on focus
+  useEffect(() => {
+    if (isFocused) {
+      setPendingImage(ServiceProvider.storage.getPendingUpload());
+    }
+  }, [isFocused]);
+
+  // 2. Zeroconf Discovery & Periodic Connection verification
+  useEffect(() => {
+    if (!isPaired) {
+      setConnectionState('Offline');
+      return;
+    }
+
+    const discovery = ServiceProvider.discovery;
+    let isActive = true;
+
+    // Set to Discovering initially
+    setConnectionState('Discovering');
+
+    // Run quick ping validation if host is already saved
+    const runPingCheck = async (host: string, port: number) => {
+      try {
+        const pingUrl = `http://${host}:${port}/ping`;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 2000);
+        const res = await fetch(pingUrl, { signal: controller.signal });
+        clearTimeout(timeout);
+        if (res.ok && isActive) {
+          setConnectionState('Connected');
+          return true;
+        }
+      } catch {}
+      if (isActive) {
+        setConnectionState('Discovering');
+      }
+      return false;
+    };
+
+    if (config.desktopHost) {
+      runPingCheck(config.desktopHost, config.desktopPort);
+    }
+
+    discovery.onDiscovered((service) => {
+      if (service.uuid === config.pairedDesktopId && isActive) {
+        if (service.host !== config.desktopHost || service.port !== config.desktopPort) {
+          updateConfig({
+            desktopHost: service.host,
+            desktopPort: service.port,
+          });
+        }
+        runPingCheck(service.host, service.port);
+      }
+    });
+
+    discovery.startScan();
+
+    // Ping check every 5 seconds to detect server going offline
+    const timer = setInterval(() => {
+      if (config.desktopHost) {
+        runPingCheck(config.desktopHost, config.desktopPort);
+      }
+    }, 5000);
+
+    return () => {
+      isActive = false;
+      discovery.stopScan();
+      clearInterval(timer);
+    };
+  }, [isPaired, config.pairedDesktopId, config.desktopHost, config.desktopPort, updateConfig]);
+
+  const handleCapture = useCallback(async () => {
+    if (isCapturing || !cameraRef.current) return;
+    setIsCapturing(true);
+
+    try {
+      const photo = await cameraRef.current.takePhoto({
+        flash: flashMode,
+        enableShutterSound: true,
+      });
+
+      const uri = `file://${photo.path}`;
+      
+      // Determine file size via blob query
+      let fileSize = 0;
+      try {
+        const res = await fetch(uri);
+        const blob = await res.blob();
+        fileSize = blob.size;
+      } catch {}
+
+      const rawImage: CapturedImage = {
+        uri,
+        width: photo.width,
+        height: photo.height,
+        mimeType: 'image/jpeg',
+        fileSize,
+        fileName: photo.path.split('/').pop() || `capture_${Date.now()}.jpg`,
+      };
+
+      // Compress BEFORE preview so preview matches final upload
+      const compressedImage = await ServiceProvider.image.compressImage(
+        rawImage,
+        config.qualityPreset
+      );
+
+      navigation.navigate('Preview', { image: compressedImage });
+    } catch (error) {
+      Alert.alert('Capture Error', 'Failed to capture image. Please try again.');
+    } finally {
+      setIsCapturing(false);
+    }
+  }, [isCapturing, flashMode, config.qualityPreset, navigation]);
+
+  const handleGallery = useCallback(async () => {
+    if (isCapturing) return;
+    setIsCapturing(true);
+    try {
+      const image = await ServiceProvider.image.pickFromGallery();
+      if (image) {
+        // Compress BEFORE preview
+        const compressedImage = await ServiceProvider.image.compressImage(
+          image,
+          config.qualityPreset
+        );
+        navigation.navigate('Preview', { image: compressedImage });
+      }
+    } catch (error) {
+      Alert.alert('Gallery Error', 'Failed to pick image. Please try again.');
+    } finally {
+      setIsCapturing(false);
+    }
+  }, [isCapturing, config.qualityPreset, navigation]);
+
+  const handleSettings = useCallback(() => {
+    navigation.navigate('Settings');
+  }, [navigation]);
+
+  const handleBadgePress = useCallback(() => {
+    if (isPaired) {
+      navigation.navigate('Settings');
+    } else {
+      navigation.navigate('QrScanner');
+    }
+  }, [isPaired, navigation]);
+
+  const handleRetryUpload = useCallback(async () => {
+    if (!pendingImage || isRetrying) return;
+    setIsRetrying(true);
+
+    try {
+      const result = await ServiceProvider.upload.uploadImage(pendingImage);
+      if (result.success) {
+        Alert.alert('Success', 'Queued image uploaded successfully!');
+        setPendingImage(null);
+      } else {
+        Alert.alert('Retry Failed', result.message);
+      }
+    } catch (err: any) {
+      Alert.alert('Retry Error', err.message || 'An unexpected network error occurred.');
+    } finally {
+      setIsRetrying(false);
+    }
+  }, [pendingImage, isRetrying]);
+
+  const toggleFlash = useCallback(() => {
+    setFlashMode((prev) => (prev === 'on' ? 'off' : 'on'));
+  }, []);
+
+  // --- Render Permission Screen ---
+  if (!hasPermission) {
+    return (
+      <View style={styles.centerContainer}>
+        <Text style={styles.errorIcon}>🛡️</Text>
+        <Text style={styles.permissionText}>
+          SnapBridge requires camera access to snap drawings and documents.
+        </Text>
+        <TouchableOpacity
+          style={styles.retryButton}
+          onPress={requestPermission}>
+          <Text style={styles.retryButtonText}>Grant Permission</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const getConnectionColor = () => {
+    if (connectionState === 'Connected') return Colors.success;
+    if (connectionState === 'Discovering') return Colors.warning;
+    return Colors.error;
+  };
+
+  const getStatusLabel = () => {
+    if (!isPaired) return 'Tap to Pair Device';
+    return `${config.pairedDesktopName} (${connectionState})`;
+  };
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      {/* Header */}
+      <View style={styles.header}>
+        <Text style={styles.title}>SnapBridge</Text>
+        <TouchableOpacity
+          style={styles.connectionBadge}
+          onPress={handleBadgePress}
+          activeOpacity={0.7}>
+          <View style={[styles.statusDot, { backgroundColor: getConnectionColor() }]} />
+          <Text style={styles.connectionText}>{getStatusLabel()}</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Failed Upload Retry Banner */}
+      {pendingImage && (
+        <View style={styles.retryBanner}>
+          <Text style={styles.retryBannerText}>⚠️ 1 Pending Upload Failed</Text>
+          <TouchableOpacity
+            style={styles.retryBannerButton}
+            onPress={handleRetryUpload}
+            disabled={isRetrying}
+            activeOpacity={0.7}>
+            {isRetrying ? (
+              <ActivityIndicator size="small" color={Colors.primary} />
+            ) : (
+              <Text style={styles.retryBannerButtonText}>Retry Now</Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Camera Preview Area */}
+      <View style={styles.previewArea}>
+        {device && isFocused ? (
+          <View style={StyleSheet.absoluteFill}>
+            <Camera
+              ref={cameraRef}
+              style={StyleSheet.absoluteFill}
+              device={device}
+              isActive={isFocused}
+              photo={true}
+              torch={flashMode}
+            />
+            {/* Flash toggle overlay */}
+            <TouchableOpacity
+              style={styles.flashButton}
+              onPress={toggleFlash}
+              activeOpacity={0.7}>
+              <Text style={styles.flashText}>{flashMode === 'on' ? '⚡ On' : '⚡ Off'}</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <View style={styles.previewPlaceholder}>
+            <Text style={styles.previewIcon}>📷</Text>
+            <Text style={styles.previewText}>Loading Camera...</Text>
+          </View>
+        )}
+      </View>
+
+      {/* Bottom Controls */}
+      <View style={[styles.bottomBar, { paddingBottom: insets.bottom + Spacing.md }]}>
+        {/* Gallery Button */}
+        <TouchableOpacity
+          style={styles.sideButton}
+          onPress={handleGallery}
+          activeOpacity={0.7}
+          disabled={isCapturing}>
+          <Text style={styles.sideButtonIcon}>🖼️</Text>
+          <Text style={styles.sideButtonLabel}>Gallery</Text>
+        </TouchableOpacity>
+
+        {/* Capture Button */}
+        <TouchableOpacity
+          style={styles.captureButton}
+          onPress={handleCapture}
+          activeOpacity={0.7}
+          disabled={isCapturing || !device}>
+          {isCapturing ? (
+            <ActivityIndicator size="large" color={Colors.white} />
+          ) : (
+            <View style={styles.captureButtonInner} />
+          )}
+        </TouchableOpacity>
+
+        {/* Settings Button */}
+        <TouchableOpacity
+          style={styles.sideButton}
+          onPress={handleSettings}
+          activeOpacity={0.7}>
+          <Text style={styles.sideButtonIcon}>⚙️</Text>
+          <Text style={styles.sideButtonLabel}>Settings</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: Colors.background,
+  },
+  centerContainer: {
+    flex: 1,
+    backgroundColor: Colors.background,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: Spacing.xl,
+  },
+  permissionText: {
+    fontSize: FontSize.md,
+    color: Colors.textSecondary,
+    textAlign: 'center',
+    marginTop: Spacing.md,
+    lineHeight: 22,
+  },
+  errorIcon: {
+    fontSize: 48,
+    marginBottom: Spacing.sm,
+  },
+  retryButton: {
+    marginTop: Spacing.xl,
+    paddingHorizontal: Spacing.xl,
+    paddingVertical: Spacing.md,
+    backgroundColor: Colors.primary,
+    borderRadius: BorderRadius.md,
+  },
+  retryButtonText: {
+    color: Colors.white,
+    fontWeight: '600',
+    fontSize: FontSize.md,
+  },
+  header: {
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: Spacing.md,
+    alignItems: 'center',
+  },
+  title: {
+    fontSize: FontSize.title,
+    fontWeight: '700',
+    color: Colors.text,
+    letterSpacing: 0.5,
+  },
+  connectionBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: Spacing.sm,
+    backgroundColor: Colors.surface,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.xs + 2,
+    borderRadius: BorderRadius.full,
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: Spacing.sm,
+  },
+  connectionText: {
+    fontSize: FontSize.sm,
+    color: Colors.textSecondary,
+    fontWeight: '500',
+  },
+  retryBanner: {
+    flexDirection: 'row',
+    backgroundColor: Colors.error + '25',
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: Spacing.sm,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderLeftWidth: 4,
+    borderLeftColor: Colors.error,
+    marginHorizontal: Spacing.md,
+    borderRadius: BorderRadius.sm,
+  },
+  retryBannerText: {
+    color: Colors.error,
+    fontSize: FontSize.sm,
+    fontWeight: '600',
+  },
+  retryBannerButton: {
+    backgroundColor: Colors.white,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.xs,
+    borderRadius: BorderRadius.sm,
+  },
+  retryBannerButtonText: {
+    color: Colors.primary,
+    fontWeight: '700',
+    fontSize: FontSize.xs,
+  },
+  previewArea: {
+    flex: 1,
+    marginHorizontal: Spacing.md,
+    marginVertical: Spacing.md,
+    borderRadius: BorderRadius.lg,
+    backgroundColor: Colors.surface,
+    overflow: 'hidden',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  previewPlaceholder: {
+    alignItems: 'center',
+    padding: Spacing.xl,
+  },
+  previewIcon: {
+    fontSize: 64,
+    marginBottom: Spacing.md,
+  },
+  previewText: {
+    fontSize: FontSize.xl,
+    color: Colors.textSecondary,
+    fontWeight: '600',
+  },
+  flashButton: {
+    position: 'absolute',
+    top: Spacing.md,
+    right: Spacing.md,
+    backgroundColor: 'rgba(15, 23, 42, 0.65)',
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.xs + 2,
+    borderRadius: BorderRadius.full,
+  },
+  flashText: {
+    color: Colors.white,
+    fontWeight: '600',
+    fontSize: FontSize.sm,
+  },
+  bottomBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.lg,
+  },
+  sideButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 64,
+    height: 64,
+  },
+  sideButtonIcon: {
+    fontSize: 28,
+    marginBottom: Spacing.xs,
+  },
+  sideButtonLabel: {
+    fontSize: FontSize.xs,
+    color: Colors.textSecondary,
+    fontWeight: '500',
+  },
+  captureButton: {
+    width: 76,
+    height: 76,
+    borderRadius: 38,
+    borderWidth: 4,
+    borderColor: Colors.border,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+  },
+  captureButtonInner: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: Colors.white,
+  },
+});
+
+
+// File: e:\SnapBridge\mobile\src\screens\PreviewScreen.tsx
+import React, { useState, useCallback } from 'react';
+import {
+  View,
+  Text,
+  Image,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  ScrollView,
+  ActivityIndicator,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import type { RootStackParamList } from '../navigation/types';
+import { useConfig } from '../hooks/useConfig';
+import { Colors, Spacing, FontSize, BorderRadius } from '../theme';
+import { ServiceProvider } from '../services/ServiceProvider';
+
+type Props = NativeStackScreenProps<RootStackParamList, 'Preview'>;
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function PreviewScreen({ route, navigation }: Props): React.JSX.Element {
+  const insets = useSafeAreaInsets();
+  const { config } = useConfig();
+  const { image } = route.params;
+  const [isUploading, setIsUploading] = useState(false);
+  const [progressPercent, setProgressPercent] = useState(0);
+  const [showSuccessOverlay, setShowSuccessOverlay] = useState(false);
+
+  const isPaired = config.pairedDesktopName !== null;
+
+  const handleUpload = useCallback(async () => {
+    if (!isPaired) {
+      Alert.alert('Not Paired', 'Please pair with your desktop application first.');
+      return;
+    }
+
+    setIsUploading(true);
+    setProgressPercent(0);
+
+    try {
+      const result = await ServiceProvider.upload.uploadImage(image, (progress) => {
+        setProgressPercent(progress.percent);
+      });
+
+      if (result.success) {
+        if (config.autoReturn) {
+          setShowSuccessOverlay(true);
+          setTimeout(() => {
+            setShowSuccessOverlay(false);
+            navigation.navigate('Camera');
+          }, 1200);
+        } else {
+          Alert.alert('Success', 'Image transferred successfully!', [
+            { text: 'OK', onPress: () => navigation.navigate('Camera') }
+          ]);
+        }
+      } else {
+        Alert.alert('Upload Failed', result.message);
+      }
+    } catch (err: any) {
+      Alert.alert('Upload Error', err.message || 'An unexpected error occurred.');
+    } finally {
+      setIsUploading(false);
+    }
+  }, [image, isPaired, config.autoReturn, navigation]);
+
+  const handleRetake = useCallback(() => {
+    navigation.goBack();
+  }, [navigation]);
+
+  const aspectRatio = image.width > 0 && image.height > 0
+    ? image.width / image.height
+    : 1;
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      {/* Connection Status Bar */}
+      <View style={styles.statusBar}>
+        <TouchableOpacity
+          style={styles.backButton}
+          onPress={handleRetake}
+          activeOpacity={0.7}>
+          <Text style={styles.backArrow}>←</Text>
+        </TouchableOpacity>
+        <Text style={styles.statusTitle}>Preview</Text>
+        <View style={styles.connectionIndicator}>
+          <View
+            style={[
+              styles.statusDot,
+              { backgroundColor: isPaired ? Colors.success : Colors.textMuted },
+            ]}
+          />
+          <Text style={styles.connectionLabel}>
+            {isPaired ? 'Connected' : 'Not Paired'}
+          </Text>
+        </View>
+      </View>
+
+      <ScrollView
+        style={styles.scrollArea}
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}>
+        {/* Image Preview */}
+        <View style={styles.imageContainer}>
+          <Image
+            source={{ uri: image.uri }}
+            style={[styles.imagePreview, { aspectRatio }]}
+            resizeMode="contain"
+          />
+        </View>
+
+        {/* Image Metadata */}
+        <View style={styles.metadataCard}>
+          <Text style={styles.metadataTitle}>Image Details</Text>
+          <View style={styles.metadataRow}>
+            <Text style={styles.metadataLabel}>Dimensions</Text>
+            <Text style={styles.metadataValue}>
+              {image.width} × {image.height}
+            </Text>
+          </View>
+          <View style={styles.metadataDivider} />
+          <View style={styles.metadataRow}>
+            <Text style={styles.metadataLabel}>File Size</Text>
+            <Text style={styles.metadataValue}>
+              {formatFileSize(image.fileSize)}
+            </Text>
+          </View>
+          <View style={styles.metadataDivider} />
+          <View style={styles.metadataRow}>
+            <Text style={styles.metadataLabel}>Type</Text>
+            <Text style={styles.metadataValue}>{image.mimeType}</Text>
+          </View>
+          <View style={styles.metadataDivider} />
+          <View style={styles.metadataRow}>
+            <Text style={styles.metadataLabel}>Filename</Text>
+            <Text style={styles.metadataValue} numberOfLines={1}>
+              {image.fileName}
+            </Text>
+          </View>
+        </View>
+      </ScrollView>
+
+      {/* Action Buttons */}
+      <View style={[styles.actionBar, { paddingBottom: insets.bottom + Spacing.md }]}>
+        <TouchableOpacity
+          style={styles.retakeButton}
+          onPress={handleRetake}
+          activeOpacity={0.7}
+          disabled={isUploading}>
+          <Text style={styles.retakeButtonText}>Retake</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.uploadButton, isUploading && { opacity: 0.8 }]}
+          onPress={handleUpload}
+          activeOpacity={0.7}
+          disabled={isUploading}>
+          {isUploading ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <ActivityIndicator size="small" color={Colors.white} style={{ marginRight: Spacing.sm }} />
+              <Text style={styles.uploadButtonText}>
+                {progressPercent > 0 ? `Uploading (${progressPercent}%)` : 'Uploading...'}
+              </Text>
+            </View>
+          ) : (
+            <Text style={styles.uploadButtonText}>Upload</Text>
+          )}
+        </TouchableOpacity>
+      </View>
+
+      {/* Success Animation Overlay */}
+      {showSuccessOverlay && (
+        <View style={StyleSheet.absoluteFillObject}>
+          <View style={styles.overlayBg} />
+          <View style={styles.successContainer}>
+            <Text style={styles.successIcon}>✅</Text>
+            <Text style={styles.successText}>Uploaded Successfully!</Text>
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: Colors.background,
+  },
+  statusBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  backButton: {
+    width: 40,
+    height: 40,
+    borderRadius: BorderRadius.md,
+    backgroundColor: Colors.surface,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  backArrow: {
+    fontSize: FontSize.xxl,
+    color: Colors.text,
+    marginTop: -2,
+  },
+  statusTitle: {
+    fontSize: FontSize.lg,
+    fontWeight: '600',
+    color: Colors.text,
+  },
+  connectionIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: Colors.surface,
+    paddingHorizontal: Spacing.sm + 4,
+    paddingVertical: Spacing.xs + 2,
+    borderRadius: BorderRadius.full,
+  },
+  statusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    marginRight: Spacing.xs + 2,
+  },
+  connectionLabel: {
+    fontSize: FontSize.xs,
+    color: Colors.textSecondary,
+    fontWeight: '500',
+  },
+  scrollArea: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingHorizontal: Spacing.md,
+    paddingBottom: Spacing.md,
+  },
+  imageContainer: {
+    marginTop: Spacing.md,
+    borderRadius: BorderRadius.lg,
+    overflow: 'hidden',
+    backgroundColor: Colors.surface,
+  },
+  imagePreview: {
+    width: '100%',
+  },
+  metadataCard: {
+    marginTop: Spacing.md,
+    backgroundColor: Colors.surface,
+    borderRadius: BorderRadius.lg,
+    padding: Spacing.lg,
+  },
+  metadataTitle: {
+    fontSize: FontSize.lg,
+    fontWeight: '600',
+    color: Colors.text,
+    marginBottom: Spacing.md,
+  },
+  metadataRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: Spacing.sm,
+  },
+  metadataLabel: {
+    fontSize: FontSize.md,
+    color: Colors.textMuted,
+    fontWeight: '500',
+  },
+  metadataValue: {
+    fontSize: FontSize.md,
+    color: Colors.text,
+    fontWeight: '500',
+    maxWidth: '60%',
+    textAlign: 'right',
+  },
+  metadataDivider: {
+    height: 1,
+    backgroundColor: Colors.surfaceLight,
+  },
+  actionBar: {
+    flexDirection: 'row',
+    paddingHorizontal: Spacing.md,
+    paddingTop: Spacing.md,
+    gap: Spacing.sm,
+  },
+  retakeButton: {
+    flex: 1,
+    height: 52,
+    borderRadius: BorderRadius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  retakeButtonText: {
+    fontSize: FontSize.lg,
+    fontWeight: '600',
+    color: Colors.textSecondary,
+  },
+  uploadButton: {
+    flex: 2,
+    height: 52,
+    borderRadius: BorderRadius.lg,
+    backgroundColor: Colors.primary,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 4,
+    shadowColor: Colors.primary,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+  },
+  uploadButtonText: {
+    fontSize: FontSize.lg,
+    fontWeight: '700',
+    color: Colors.white,
+  },
+  overlayBg: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+  },
+  successContainer: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  successIcon: {
+    fontSize: 72,
+    marginBottom: Spacing.md,
+  },
+  successText: {
+    fontSize: FontSize.xl,
+    color: Colors.white,
+    fontWeight: '700',
+  },
+});
+
+
+// File: e:\SnapBridge\mobile\src\screens\QrScannerScreen.tsx
+import React, { useState, useCallback, useEffect } from 'react';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  ActivityIndicator,
+  PermissionsAndroid,
+  Platform,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import type { RootStackParamList } from '../navigation/types';
+import { Colors, Spacing, FontSize, BorderRadius } from '../theme';
+import { ServiceProvider } from '../services/ServiceProvider';
+import CameraScreen from 'react-native-camera-kit';
+
+type Props = NativeStackScreenProps<RootStackParamList, 'QrScanner'>;
+
+const requestCameraPermission = async (): Promise<boolean> => {
+  if (Platform.OS === 'android') {
+    try {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.CAMERA,
+        {
+          title: 'Camera Permission',
+          message: 'SnapBridge needs camera access to scan the pairing QR code.',
+          buttonNeutral: 'Ask Me Later',
+          buttonNegative: 'Cancel',
+          buttonPositive: 'OK',
+        }
+      );
+      return granted === PermissionsAndroid.RESULTS.GRANTED;
+    } catch (err) {
+      console.warn(err);
+      return false;
+    }
+  }
+  return true;
+};
+
+export function QrScannerScreen({ navigation }: Props): React.JSX.Element {
+  const insets = useSafeAreaInsets();
+  const [hasPermission, setHasPermission] = useState<boolean | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [statusText, setStatusText] = useState('Align the QR code inside the frame');
+
+  useEffect(() => {
+    async function checkPermission() {
+      const allowed = await requestCameraPermission();
+      setHasPermission(allowed);
+    }
+    checkPermission();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      // Clean up scanning on unmount
+      ServiceProvider.discovery.stopScan();
+    };
+  }, []);
+
+  const handleCancel = useCallback(() => {
+    navigation.goBack();
+  }, [navigation]);
+
+  const handleReadCode = useCallback(async (event: any) => {
+    if (isProcessing) return;
+
+    const code = event.nativeEvent?.codeStringValue;
+    if (!code) return;
+
+    setIsProcessing(true);
+    setStatusText('Decoding pairing QR code...');
+
+    try {
+      const payload = JSON.parse(code);
+      if (!payload.uuid || !payload.secret || !payload.port || payload.service !== 'snapbridge') {
+        throw new Error('Invalid QR code format. Please ensure you are scanning the SnapBridge pairing code.');
+      }
+
+      setStatusText('Discovering desktop host on local network...');
+
+      const discovery = ServiceProvider.discovery;
+
+      // Setup discovery timeout
+      const timeoutId = setTimeout(() => {
+        discovery.stopScan();
+        Alert.alert(
+          'Discovery Timeout',
+          'Could not find the desktop host on the local network. Please ensure both devices are connected to the same Wi-Fi network and try again.',
+          [{ text: 'OK', onPress: () => setIsProcessing(false) }]
+        );
+        setStatusText('Align the QR code inside the frame');
+      }, 15000);
+
+      discovery.onDiscovered(async (service) => {
+        if (service.uuid === payload.uuid) {
+          clearTimeout(timeoutId);
+          discovery.stopScan();
+
+          setStatusText(`Pairing with ${service.name}...`);
+
+          try {
+            const pairResult = await ServiceProvider.upload.pairDevice(
+              service.host,
+              payload.port,
+              payload.secret
+            );
+
+            if (pairResult.success) {
+              Alert.alert('Success', `Successfully paired with ${pairResult.deviceName || 'Desktop Host'}!`, [
+                { text: 'OK', onPress: () => navigation.navigate('Camera') }
+              ]);
+            } else {
+              Alert.alert('Pairing Failed', pairResult.message, [
+                { text: 'OK', onPress: () => setIsProcessing(false) }
+              ]);
+              setStatusText('Align the QR code inside the frame');
+            }
+          } catch (err: any) {
+            Alert.alert('Pairing Error', err.message || 'Connection failed.', [
+              { text: 'OK', onPress: () => setIsProcessing(false) }
+            ]);
+            setStatusText('Align the QR code inside the frame');
+          }
+        }
+      });
+
+      discovery.startScan();
+
+    } catch (error: any) {
+      Alert.alert('Invalid QR Code', error.message || 'Could not read pairing configuration.', [
+        { text: 'OK', onPress: () => setIsProcessing(false) }
+      ]);
+      setStatusText('Align the QR code inside the frame');
+    }
+  }, [isProcessing, navigation]);
+
+  if (hasPermission === null) {
+    return (
+      <View style={styles.centerContainer}>
+        <ActivityIndicator size="large" color={Colors.primary} />
+        <Text style={styles.permissionText}>Checking camera permission...</Text>
+      </View>
+    );
+  }
+
+  if (hasPermission === false) {
+    return (
+      <View style={styles.centerContainer}>
+        <Text style={styles.errorIcon}>⚠️</Text>
+        <Text style={styles.permissionText}>Camera permission is required to scan the pairing QR code.</Text>
+        <TouchableOpacity
+          style={styles.retryButton}
+          onPress={async () => {
+            const allowed = await requestCameraPermission();
+            setHasPermission(allowed);
+          }}>
+          <Text style={styles.retryButtonText}>Grant Permission</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      <CameraScreen
+        style={StyleSheet.absoluteFill}
+        scanBarcode={!isProcessing}
+        onReadCode={handleReadCode}
+        showFrame={true}
+        laserColor={Colors.accent}
+        frameColor={Colors.primary}
+        hideControls={true}
+      />
+
+      {/* Floating Header */}
+      <View style={[styles.floatingHeader, { paddingTop: insets.top + Spacing.sm }]}>
+        <TouchableOpacity
+          style={styles.cancelButton}
+          onPress={handleCancel}
+          activeOpacity={0.7}>
+          <Text style={styles.cancelText}>← Back</Text>
+        </TouchableOpacity>
+        <Text style={styles.headerTitle}>Scan QR Code</Text>
+        <View style={styles.headerSpacer} />
+      </View>
+
+      {/* Floating Status Indicator at bottom */}
+      <View style={[styles.floatingBottomBar, { paddingBottom: insets.bottom + Spacing.xl }]}>
+        <View style={styles.statusCard}>
+          {isProcessing && <ActivityIndicator size="small" color={Colors.accent} style={{ marginRight: Spacing.sm }} />}
+          <Text style={styles.statusText}>{statusText}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: Colors.black,
+  },
+  centerContainer: {
+    flex: 1,
+    backgroundColor: Colors.background,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: Spacing.xl,
+  },
+  permissionText: {
+    fontSize: FontSize.md,
+    color: Colors.textSecondary,
+    textAlign: 'center',
+    marginTop: Spacing.md,
+    lineHeight: 22,
+  },
+  errorIcon: {
+    fontSize: 48,
+    marginBottom: Spacing.sm,
+  },
+  retryButton: {
+    marginTop: Spacing.xl,
+    paddingHorizontal: Spacing.xl,
+    paddingVertical: Spacing.md,
+    backgroundColor: Colors.primary,
+    borderRadius: BorderRadius.md,
+  },
+  retryButtonText: {
+    color: Colors.white,
+    fontWeight: '600',
+    fontSize: FontSize.md,
+  },
+  floatingHeader: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: Spacing.md,
+    backgroundColor: 'rgba(15, 23, 42, 0.65)',
+  },
+  cancelButton: {
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: Spacing.sm,
+  },
+  cancelText: {
+    fontSize: FontSize.md,
+    color: Colors.accent,
+    fontWeight: '600',
+  },
+  headerTitle: {
+    fontSize: FontSize.lg,
+    fontWeight: '700',
+    color: Colors.text,
+  },
+  headerSpacer: {
+    width: 60,
+  },
+  floatingBottomBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    paddingHorizontal: Spacing.xl,
+  },
+  statusCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+    borderRadius: BorderRadius.full,
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: Spacing.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    shadowColor: Colors.black,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 6,
+  },
+  statusText: {
+    fontSize: FontSize.sm,
+    color: Colors.text,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+});
+
+
+// File: e:\SnapBridge\mobile\src\screens\SettingsScreen.tsx
+import React, { useCallback } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  Switch,
+  StyleSheet,
+  Alert,
+  ScrollView,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import type { RootStackParamList } from '../navigation/types';
+import { useConfig } from '../hooks/useConfig';
+import { Colors, Spacing, FontSize, BorderRadius } from '../theme';
+
+type Props = NativeStackScreenProps<RootStackParamList, 'Settings'>;
+
+const PRESET_OPTIONS = ['High', 'Balanced', 'Fast'] as const;
+
+export function SettingsScreen({ navigation }: Props): React.JSX.Element {
+  const insets = useSafeAreaInsets();
+  const { config, updateConfig } = useConfig();
+
+  const isPaired = config.pairedDesktopName !== null;
+
+  const handleBack = useCallback(() => {
+    navigation.goBack();
+  }, [navigation]);
+
+  const handleDeviceNameChange = useCallback(
+    (text: string) => {
+      updateConfig({ deviceName: text });
+    },
+    [updateConfig],
+  );
+
+  const handleScanQr = useCallback(() => {
+    navigation.navigate('QrScanner');
+  }, [navigation]);
+
+  const handleUnpair = useCallback(() => {
+    Alert.alert(
+      'Unpair Device',
+      `Are you sure you want to unpair from "${config.pairedDesktopName}"? You will need to scan the QR code again to reconnect.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Unpair',
+          style: 'destructive',
+          onPress: () => {
+            updateConfig({
+              pairedDesktopId: null,
+              pairedDesktopName: null,
+              pairingSecret: null,
+              desktopHost: null,
+            });
+          },
+        },
+      ],
+    );
+  }, [config.pairedDesktopName, updateConfig]);
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      {/* Header */}
+      <View style={styles.header}>
+        <TouchableOpacity
+          style={styles.backButton}
+          onPress={handleBack}
+          activeOpacity={0.7}>
+          <Text style={styles.backArrow}>←</Text>
+        </TouchableOpacity>
+        <Text style={styles.headerTitle}>Settings</Text>
+        <View style={styles.headerSpacer} />
+      </View>
+
+      <ScrollView
+        style={styles.scrollArea}
+        contentContainerStyle={[
+          styles.scrollContent,
+          { paddingBottom: insets.bottom + Spacing.xl },
+        ]}
+        showsVerticalScrollIndicator={false}>
+        
+        {/* Device Settings */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Device</Text>
+          <View style={styles.card}>
+            <Text style={styles.fieldLabel}>Device Name</Text>
+            <TextInput
+              style={styles.textInput}
+              value={config.deviceName}
+              onChangeText={handleDeviceNameChange}
+              placeholder="Enter device name"
+              placeholderTextColor={Colors.textMuted}
+              maxLength={40}
+              autoCorrect={false}
+            />
+          </View>
+        </View>
+
+        {/* Compression Preset */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Compression Quality Preset</Text>
+          <View style={styles.card}>
+            <View style={styles.presetSelector}>
+              {PRESET_OPTIONS.map((preset) => {
+                const isSelected = config.qualityPreset === preset;
+                let description = '2048px | Balanced';
+                if (preset === 'High') description = '3072px | High';
+                if (preset === 'Fast') description = '1024px | Small';
+
+                return (
+                  <TouchableOpacity
+                    key={preset}
+                    style={[
+                      styles.presetOption,
+                      isSelected && styles.presetOptionSelected,
+                    ]}
+                    onPress={() => updateConfig({ qualityPreset: preset })}
+                    activeOpacity={0.7}>
+                    <Text
+                      style={[
+                        styles.presetOptionText,
+                        isSelected && styles.presetOptionTextSelected,
+                      ]}>
+                      {preset === 'High' ? 'High Quality' : preset === 'Balanced' ? 'Balanced' : 'Fast'}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.presetDescText,
+                        isSelected && styles.presetDescTextSelected,
+                      ]}>
+                      {description}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        </View>
+
+        {/* Auto Upload / Auto Return */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Workflow Preferences</Text>
+          <View style={styles.card}>
+            <View style={styles.toggleRow}>
+              <View style={styles.toggleLabel}>
+                <Text style={styles.fieldLabel}>Auto Upload</Text>
+                <Text style={styles.fieldDescription}>
+                  Automatically upload captured images to the paired desktop
+                </Text>
+              </View>
+              <Switch
+                value={config.autoUpload}
+                onValueChange={(val) => updateConfig({ autoUpload: val })}
+                trackColor={{ false: Colors.surfaceLight, true: Colors.primaryLight }}
+                thumbColor={config.autoUpload ? Colors.primary : Colors.textMuted}
+              />
+            </View>
+            <View style={styles.cardDivider} />
+            <View style={[styles.toggleRow, { marginTop: Spacing.md }]}>
+              <View style={styles.toggleLabel}>
+                <Text style={styles.fieldLabel}>Auto Return</Text>
+                <Text style={styles.fieldDescription}>
+                  Automatically return to camera screen after a successful upload
+                </Text>
+              </View>
+              <Switch
+                value={config.autoReturn}
+                onValueChange={(val) => updateConfig({ autoReturn: val })}
+                trackColor={{ false: Colors.surfaceLight, true: Colors.primaryLight }}
+                thumbColor={config.autoReturn ? Colors.primary : Colors.textMuted}
+              />
+            </View>
+          </View>
+        </View>
+
+        {/* Connection Setup & Manual IP overrides */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Desktop Connection</Text>
+          <View style={styles.card}>
+            <View style={styles.pairedInfo}>
+              <Text style={styles.overrideTitle}>Manual IP Address Override</Text>
+              <View style={styles.pairedRow}>
+                <Text style={styles.fieldLabel}>Host IP</Text>
+                <TextInput
+                  style={styles.overrideInput}
+                  value={config.desktopHost || ''}
+                  onChangeText={(text) => updateConfig({ desktopHost: text || null })}
+                  placeholder="e.g. 192.168.1.50"
+                  placeholderTextColor={Colors.textMuted}
+                  autoCorrect={false}
+                  autoCapitalize="none"
+                />
+              </View>
+              <View style={styles.pairedRow}>
+                <Text style={styles.fieldLabel}>Port</Text>
+                <TextInput
+                  style={styles.overrideInput}
+                  value={config.desktopPort ? config.desktopPort.toString() : ''}
+                  onChangeText={(text) => {
+                    const p = parseInt(text, 10);
+                    updateConfig({ desktopPort: isNaN(p) ? 0 : p });
+                  }}
+                  keyboardType="number-pad"
+                  placeholder="e.g. 53210"
+                  placeholderTextColor={Colors.textMuted}
+                />
+              </View>
+            </View>
+
+            <View style={styles.cardDivider} />
+
+            {isPaired ? (
+              <View style={{ marginTop: Spacing.md }}>
+                <View style={styles.pairedStatusRow}>
+                  <Text style={styles.fieldLabel}>Paired Desktop</Text>
+                  <Text style={styles.pairedValue}>{config.pairedDesktopName}</Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.unpairButton}
+                  onPress={handleUnpair}
+                  activeOpacity={0.7}>
+                  <Text style={styles.unpairButtonText}>Reset Pairing</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View style={styles.notPairedContainer}>
+                <Text style={styles.notPairedIcon}>📡</Text>
+                <Text style={styles.notPairedText}>Not Paired</Text>
+                <Text style={styles.notPairedSubtext}>
+                  Scan a QR code from the desktop app to pair
+                </Text>
+                <TouchableOpacity
+                  style={styles.scanQrButton}
+                  onPress={handleScanQr}
+                  activeOpacity={0.7}>
+                  <Text style={styles.scanQrButtonText}>Scan QR Code</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        </View>
+
+        {/* About Section */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>About</Text>
+          <View style={styles.card}>
+            <Text style={styles.aboutTitle}>SnapBridge Mobile</Text>
+            <Text style={styles.aboutVersion}>Version 1.0.0 (Sprint 5)</Text>
+            <Text style={styles.aboutDesc}>
+              A secure, zero-configuration local photo bridge powered by React Native and Clean Architecture.
+            </Text>
+          </View>
+        </View>
+
+      </ScrollView>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: Colors.background,
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  backButton: {
+    width: 40,
+    height: 40,
+    borderRadius: BorderRadius.md,
+    backgroundColor: Colors.surface,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  backArrow: {
+    fontSize: FontSize.xxl,
+    color: Colors.text,
+    marginTop: -2,
+  },
+  headerTitle: {
+    fontSize: FontSize.xl,
+    fontWeight: '700',
+    color: Colors.text,
+  },
+  headerSpacer: {
+    width: 40,
+  },
+  scrollArea: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingHorizontal: Spacing.md,
+  },
+  section: {
+    marginTop: Spacing.lg,
+  },
+  sectionTitle: {
+    fontSize: FontSize.sm,
+    fontWeight: '600',
+    color: Colors.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    marginBottom: Spacing.sm,
+    marginLeft: Spacing.xs,
+  },
+  card: {
+    backgroundColor: Colors.surface,
+    borderRadius: BorderRadius.lg,
+    padding: Spacing.md,
+  },
+  fieldLabel: {
+    fontSize: FontSize.md,
+    fontWeight: '600',
+    color: Colors.text,
+  },
+  fieldDescription: {
+    fontSize: FontSize.sm,
+    color: Colors.textMuted,
+    marginTop: Spacing.xs,
+    lineHeight: 18,
+  },
+  textInput: {
+    marginTop: Spacing.sm,
+    backgroundColor: Colors.surfaceLight,
+    borderRadius: BorderRadius.md,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+    fontSize: FontSize.md,
+    color: Colors.text,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  presetSelector: {
+    flexDirection: 'column',
+    gap: Spacing.sm,
+  },
+  presetOption: {
+    height: 58,
+    borderRadius: BorderRadius.md,
+    backgroundColor: Colors.surfaceLight,
+    paddingHorizontal: Spacing.md,
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  presetOptionSelected: {
+    backgroundColor: Colors.primary,
+    borderColor: Colors.primaryLight,
+  },
+  presetOptionText: {
+    fontSize: FontSize.md,
+    fontWeight: '700',
+    color: Colors.textSecondary,
+  },
+  presetOptionTextSelected: {
+    color: Colors.white,
+  },
+  presetDescText: {
+    fontSize: FontSize.xs,
+    color: Colors.textMuted,
+    marginTop: 2,
+  },
+  presetDescTextSelected: {
+    color: Colors.primaryLight,
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  toggleLabel: {
+    flex: 1,
+    marginRight: Spacing.md,
+  },
+  cardDivider: {
+    height: 1,
+    backgroundColor: Colors.surfaceLight,
+    marginVertical: Spacing.md,
+  },
+  pairedInfo: {
+    marginBottom: Spacing.xs,
+  },
+  overrideTitle: {
+    fontSize: FontSize.md,
+    fontWeight: '700',
+    color: Colors.textSecondary,
+    marginBottom: Spacing.md,
+  },
+  pairedRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: Spacing.sm,
+    gap: Spacing.md,
+  },
+  overrideInput: {
+    flex: 1,
+    backgroundColor: Colors.surfaceLight,
+    borderRadius: BorderRadius.md,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.xs + 2,
+    fontSize: FontSize.md,
+    color: Colors.text,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    textAlign: 'right',
+  },
+  pairedStatusRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: Spacing.md,
+  },
+  pairedValue: {
+    fontSize: FontSize.md,
+    color: Colors.accent,
+    fontWeight: '700',
+  },
+  unpairButton: {
+    height: 44,
+    borderRadius: BorderRadius.md,
+    backgroundColor: Colors.error + '18',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: Colors.error + '40',
+  },
+  unpairButtonText: {
+    fontSize: FontSize.md,
+    fontWeight: '600',
+    color: Colors.error,
+  },
+  notPairedContainer: {
+    alignItems: 'center',
+    paddingVertical: Spacing.lg,
+  },
+  notPairedIcon: {
+    fontSize: 40,
+    marginBottom: Spacing.md,
+  },
+  notPairedText: {
+    fontSize: FontSize.lg,
+    fontWeight: '600',
+    color: Colors.textSecondary,
+    marginBottom: Spacing.xs,
+  },
+  notPairedSubtext: {
+    fontSize: FontSize.sm,
+    color: Colors.textMuted,
+    textAlign: 'center',
+    marginBottom: Spacing.lg,
+    lineHeight: 20,
+  },
+  scanQrButton: {
+    height: 48,
+    paddingHorizontal: Spacing.xl,
+    borderRadius: BorderRadius.lg,
+    backgroundColor: Colors.primary,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 4,
+    shadowColor: Colors.primary,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+  },
+  scanQrButtonText: {
+    fontSize: FontSize.md,
+    fontWeight: '700',
+    color: Colors.white,
+  },
+  aboutTitle: {
+    fontSize: FontSize.md,
+    fontWeight: '700',
+    color: Colors.text,
+  },
+  aboutVersion: {
+    fontSize: FontSize.xs,
+    color: Colors.accent,
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  aboutDesc: {
+    fontSize: FontSize.sm,
+    color: Colors.textMuted,
+    marginTop: Spacing.sm,
+    lineHeight: 18,
+  },
+});
+
+
+// File: e:\SnapBridge\mobile\src\services\crypto\MobileCryptoService.ts
+import CryptoJS from 'crypto-js';
+import { ICryptoService } from 'shared';
+
+export class MobileCryptoService implements ICryptoService {
+  public hmacSha256(key: string, message: string): string {
+    const hash = CryptoJS.HmacSHA256(message, key);
+    return hash.toString(CryptoJS.enc.Hex);
+  }
+
+  public verifySignature(key: string, message: string, signature: string): boolean {
+    try {
+      const calculated = this.hmacSha256(key, message);
+      return calculated.toLowerCase() === signature.toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+
+  public generateRandomToken(length: number = 32): string {
+    const randomWords = CryptoJS.lib.WordArray.random(length);
+    return randomWords.toString(CryptoJS.enc.Hex);
+  }
+}
+
+
+// File: e:\SnapBridge\mobile\src\services\image\ImageService.ts
+import { launchImageLibrary, launchCamera, ImagePickerResponse, MediaType } from 'react-native-image-picker';
+import ImageResizer from '@bam.tech/react-native-image-resizer';
+import { CapturedImage } from '../../types';
+
+export class ImageService {
+  /**
+   * Opens the device camera to capture a photo.
+   */
+  public async captureFromCamera(): Promise<CapturedImage | null> {
+    return new Promise((resolve) => {
+      launchCamera(
+        {
+          mediaType: 'photo' as MediaType,
+          quality: 0.9,
+          maxWidth: 4096,
+          maxHeight: 4096,
+          includeBase64: false,
+          saveToPhotos: false,
+        },
+        (response: ImagePickerResponse) => {
+          if (response.didCancel || response.errorCode || !response.assets?.length) {
+            resolve(null);
+            return;
+          }
+          const asset = response.assets[0];
+          resolve({
+            uri: asset.uri || '',
+            width: asset.width || 0,
+            height: asset.height || 0,
+            mimeType: asset.type || 'image/jpeg',
+            fileSize: asset.fileSize || 0,
+            fileName: asset.fileName || `capture_${Date.now()}.jpg`,
+          });
+        },
+      );
+    });
+  }
+
+  /**
+   * Opens the device gallery to pick an image.
+   */
+  public async pickFromGallery(): Promise<CapturedImage | null> {
+    return new Promise((resolve) => {
+      launchImageLibrary(
+        {
+          mediaType: 'photo' as MediaType,
+          quality: 0.9,
+          maxWidth: 4096,
+          maxHeight: 4096,
+          includeBase64: false,
+          selectionLimit: 1,
+        },
+        (response: ImagePickerResponse) => {
+          if (response.didCancel || response.errorCode || !response.assets?.length) {
+            resolve(null);
+            return;
+          }
+          const asset = response.assets[0];
+          resolve({
+            uri: asset.uri || '',
+            width: asset.width || 0,
+            height: asset.height || 0,
+            mimeType: asset.type || 'image/jpeg',
+            fileSize: asset.fileSize || 0,
+            fileName: asset.fileName || `gallery_${Date.now()}.jpg`,
+          });
+        },
+      );
+    });
+  }
+
+  /**
+   * Compresses and resizes a CapturedImage according to a quality preset.
+   */
+  public async compressImage(
+    image: CapturedImage,
+    preset: 'High' | 'Balanced' | 'Fast'
+  ): Promise<CapturedImage> {
+    let quality = 80;
+    let maxWidth = 2048;
+
+    if (preset === 'High') {
+      quality = 95;
+      maxWidth = 3072;
+    } else if (preset === 'Fast') {
+      quality = 60;
+      maxWidth = 1024;
+    }
+
+    try {
+      const result = await ImageResizer.createResizedImage(
+        image.uri,
+        maxWidth,
+        maxWidth,
+        'JPEG',
+        quality,
+        0,
+        null,
+        false,
+        { mode: 'contain', onlyScaleDown: true }
+      );
+
+      let size = result.size;
+      if (!size) {
+        try {
+          const res = await fetch(result.uri);
+          const blob = await res.blob();
+          size = blob.size;
+        } catch {
+          size = image.fileSize;
+        }
+      }
+
+      return {
+        uri: result.uri,
+        width: result.width,
+        height: result.height,
+        mimeType: 'image/jpeg',
+        fileSize: size,
+        fileName: result.name || image.fileName,
+      };
+    } catch (err: any) {
+      console.error('[ImageService] Compression failed:', err);
+      return image;
+    }
+  }
+}
+
+
+// File: e:\SnapBridge\mobile\src\services\network\DiscoveryClient.ts
+import Zeroconf, { Service } from 'react-native-zeroconf';
+
+export interface DiscoveredService {
+  name: string;
+  host: string;
+  port: number;
+  uuid: string | null;
+}
+
+export class DiscoveryClient {
+  private zeroconf: Zeroconf;
+  private isScanning = false;
+  private onDiscoveredCallback: ((service: DiscoveredService) => void) | null = null;
+  private onErrorCallback: ((err: any) => void) | null = null;
+
+  constructor() {
+    this.zeroconf = new Zeroconf();
+    this.setupListeners();
+  }
+
+  private setupListeners() {
+    this.zeroconf.on('resolved', (service: Service) => {
+      const host = service.addresses?.[0] || service.host;
+      const port = service.port;
+      const uuid = service.txt?.uuid || null;
+
+      if (host && port) {
+        const discovered: DiscoveredService = {
+          name: service.name,
+          host,
+          port,
+          uuid,
+        };
+        if (this.onDiscoveredCallback) {
+          this.onDiscoveredCallback(discovered);
+        }
+      }
+    });
+
+    this.zeroconf.on('error', (err: any) => {
+      if (this.onErrorCallback) {
+        this.onErrorCallback(err);
+      }
+    });
+  }
+
+  public onDiscovered(callback: (service: DiscoveredService) => void) {
+    this.onDiscoveredCallback = callback;
+  }
+
+  public onError(callback: (err: any) => void) {
+    this.onErrorCallback = callback;
+  }
+
+  public startScan() {
+    if (this.isScanning) return;
+    this.isScanning = true;
+    try {
+      this.zeroconf.scan('snapbridge', 'tcp');
+    } catch (err) {
+      if (this.onErrorCallback) {
+        this.onErrorCallback(err);
+      }
+    }
+  }
+
+  public stopScan() {
+    if (!this.isScanning) return;
+    this.isScanning = false;
+    try {
+      this.zeroconf.stop();
+    } catch (err) {
+      // ignore
+    }
+  }
+}
+
+
+// File: e:\SnapBridge\mobile\src\services\network\UploadClient.ts
+import { CapturedImage, UploadProgress } from '../../types';
+import { ServiceProvider } from '../ServiceProvider';
+import { HEADERS, MAX_FILE_SIZE_BYTES } from 'shared';
+
+export class UploadClient {
+  public async uploadImage(
+    image: CapturedImage,
+    onProgress?: (progress: UploadProgress) => void
+  ): Promise<{ success: boolean; message: string; uploadId?: string }> {
+    const storage = ServiceProvider.storage;
+    const config = storage.loadConfig();
+    const crypto = ServiceProvider.crypto;
+
+    // 1. Verify size limit
+    if (image.fileSize > MAX_FILE_SIZE_BYTES) {
+      return {
+        success: false,
+        message: `File size (${(image.fileSize / (1024 * 1024)).toFixed(2)}MB) exceeds maximum limit of 15MB.`,
+      };
+    }
+
+    if (!config.desktopHost || !config.pairingSecret) {
+      throw new Error('Device is not paired with a desktop host.');
+    }
+
+    // 2. Perform pre-upload ping validation to verify host is online
+    try {
+      const pingUrl = `http://${config.desktopHost}:${config.desktopPort}/ping`;
+      const pingController = new AbortController();
+      const pingTimeout = setTimeout(() => pingController.abort(), 3000); // 3-second quick timeout
+      const pingResponse = await fetch(pingUrl, { signal: pingController.signal });
+      clearTimeout(pingTimeout);
+      if (!pingResponse.ok) {
+        throw new Error('Server returned error status on ping.');
+      }
+    } catch (pingErr) {
+      // Save failed upload in queue
+      storage.savePendingUpload(image);
+      return {
+        success: false,
+        message: 'Desktop server is offline. Upload queued for manual retry.',
+      };
+    }
+
+    const correlationId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === 'x' ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+
+    const timestamp = Date.now().toString();
+    const version = '1';
+    const contentLength = image.fileSize.toString();
+
+    const signingString = `${version}:${config.deviceId}:${timestamp}:${correlationId}:${contentLength}`;
+    const signature = crypto.hmacSha256(config.pairingSecret, signingString);
+
+    const uploadUrl = `http://${config.desktopHost}:${config.desktopPort}/upload`;
+    const maxAttempts = 2; // Original + 1 retry
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (onProgress) {
+        onProgress({
+          correlationId,
+          bytesTotal: image.fileSize,
+          bytesSent: 0,
+          percent: attempt > 1 ? 10 : 0,
+          status: attempt > 1 ? 'retrying' : 'uploading',
+          attempt,
+          maxAttempts,
+        });
+      }
+
+      try {
+        const localFileResponse = await fetch(image.uri);
+        const blob = await localFileResponse.blob();
+
+        const response = await fetch(uploadUrl, {
+          method: 'POST',
+          headers: {
+            [HEADERS.VERSION]: version,
+            [HEADERS.DEVICE_ID]: config.deviceId,
+            [HEADERS.TIMESTAMP]: timestamp,
+            [HEADERS.CORRELATION_ID]: correlationId,
+            [HEADERS.SIGNATURE]: signature,
+            'Content-Type': image.mimeType || 'image/jpeg',
+            'Content-Length': contentLength,
+          },
+          body: blob,
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          let errMsg = `Upload failed with status ${response.status}`;
+          try {
+            const parsed = JSON.parse(errorText);
+            if (parsed.message) errMsg = parsed.message;
+          } catch {}
+          throw new Error(errMsg);
+        }
+
+        const result = await response.json();
+
+        // Successful upload, clear pending failed queue
+        storage.savePendingUpload(null);
+
+        if (onProgress) {
+          onProgress({
+            correlationId,
+            bytesTotal: image.fileSize,
+            bytesSent: image.fileSize,
+            percent: 100,
+            status: 'success',
+            attempt,
+            maxAttempts,
+          });
+        }
+
+        return {
+          success: true,
+          message: result.message || 'Image uploaded successfully.',
+          uploadId: result.uploadId,
+        };
+      } catch (error: any) {
+        console.warn(`[UploadClient] Upload attempt ${attempt} failed: ${error.message}`);
+        
+        if (attempt === maxAttempts) {
+          // Last attempt failed, store in queue and return failure
+          storage.savePendingUpload(image);
+          if (onProgress) {
+            onProgress({
+              correlationId,
+              bytesTotal: image.fileSize,
+              bytesSent: 0,
+              percent: 0,
+              status: 'failed',
+              error: error.message || 'Upload failed.',
+              attempt,
+              maxAttempts,
+            });
+          }
+          return {
+            success: false,
+            message: error.message || 'Upload failed after retry.',
+          };
+        }
+        
+        // Wait 1 second before retry
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    return { success: false, message: 'Upload failed.' };
+  }
+
+  public async pairDevice(
+    host: string,
+    port: number,
+    pairingSecret: string
+  ): Promise<{ success: boolean; message: string; deviceId?: string; deviceName?: string }> {
+    const storage = ServiceProvider.storage;
+    const config = storage.loadConfig();
+
+    const pairUrl = `http://${host}:${port}/pair`;
+
+    const payload = {
+      deviceId: config.deviceId,
+      deviceName: config.deviceName,
+      pairingSecret,
+    };
+
+    try {
+      const response = await fetch(pairUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errMsg = `Pairing failed with status ${response.status}`;
+        try {
+          const parsed = JSON.parse(errorText);
+          if (parsed.message) errMsg = parsed.message;
+        } catch {}
+        throw new Error(errMsg);
+      }
+
+      const result = await response.json();
+      if (result.success) {
+        // Save pairing details in config
+        storage.updateConfig({
+          desktopHost: host,
+          desktopPort: port,
+          pairingSecret: pairingSecret,
+          pairedDesktopId: result.deviceId,
+          pairedDesktopName: result.deviceName,
+        });
+
+        return {
+          success: true,
+          message: result.message || 'Device paired successfully.',
+          deviceId: result.deviceId,
+          deviceName: result.deviceName,
+        };
+      } else {
+        throw new Error(result.message || 'Pairing was rejected by the server.');
+      }
+    } catch (error: any) {
+      return {
+        success: false,
+        message: error.message || 'Failed to connect to the desktop server.',
+      };
+    }
+  }
+}
+
+
+// File: e:\SnapBridge\mobile\src\services\ServiceProvider.ts
+import { StorageService } from './storage/StorageService';
+import { MobileCryptoService, ICryptoService } from './crypto/MobileCryptoService';
+import { ImageService } from './image/ImageService';
+import { DiscoveryClient } from './network/DiscoveryClient';
+import { UploadClient } from './network/UploadClient';
+
+class ServiceProviderImpl {
+  private _storage: StorageService | null = null;
+  private _crypto: ICryptoService | null = null;
+  private _image: ImageService | null = null;
+  private _discovery: DiscoveryClient | null = null;
+  private _upload: UploadClient | null = null;
+
+  public get storage(): StorageService {
+    if (!this._storage) {
+      this._storage = new StorageService();
+    }
+    return this._storage;
+  }
+
+  public get crypto(): ICryptoService {
+    if (!this._crypto) {
+      this._crypto = new MobileCryptoService();
+    }
+    return this._crypto;
+  }
+
+  public get image(): ImageService {
+    if (!this._image) {
+      this._image = new ImageService();
+    }
+    return this._image;
+  }
+
+  public get discovery(): DiscoveryClient {
+    if (!this._discovery) {
+      this._discovery = new DiscoveryClient();
+    }
+    return this._discovery;
+  }
+
+  public get upload(): UploadClient {
+    if (!this._upload) {
+      this._upload = new UploadClient();
+    }
+    return this._upload;
+  }
+}
+
+export const ServiceProvider = new ServiceProviderImpl();
+
+
+// File: e:\SnapBridge\mobile\src\services\storage\StorageService.ts
+import { MMKV } from 'react-native-mmkv';
+import { MobileConfig } from '../../types';
+
+const STORAGE_KEY = 'snapbridge.config';
+const DEFAULT_DEVICE_NAME = 'Android Device';
+
+export class StorageService {
+  private storage: MMKV;
+
+  constructor() {
+    this.storage = new MMKV({ id: 'snapbridge-storage' });
+  }
+
+  public loadConfig(): MobileConfig {
+    const raw = this.storage.getString(STORAGE_KEY);
+    if (raw) {
+      try {
+        return JSON.parse(raw) as MobileConfig;
+      } catch {
+        // Corrupted config, return defaults
+      }
+    }
+    return this.getDefaults();
+  }
+
+  public saveConfig(config: MobileConfig): void {
+    this.storage.set(STORAGE_KEY, JSON.stringify(config));
+  }
+
+  public updateConfig(partial: Partial<MobileConfig>): MobileConfig {
+    const current = this.loadConfig();
+    const updated = { ...current, ...partial };
+    this.saveConfig(updated);
+    return updated;
+  }
+
+  public clearAll(): void {
+    this.storage.clearAll();
+  }
+
+  public getString(key: string): string | undefined {
+    return this.storage.getString(key);
+  }
+
+  public setString(key: string, value: string): void {
+    this.storage.set(key, value);
+  }
+
+  public deleteKey(key: string): void {
+    this.storage.delete(key);
+  }
+
+  public savePendingUpload(upload: CapturedImage | null): void {
+    if (upload === null) {
+      this.storage.delete('snapbridge.pending_upload');
+    } else {
+      this.storage.set('snapbridge.pending_upload', JSON.stringify(upload));
+    }
+  }
+
+  public getPendingUpload(): CapturedImage | null {
+    const raw = this.storage.getString('snapbridge.pending_upload');
+    if (raw) {
+      try {
+        return JSON.parse(raw) as CapturedImage;
+      } catch {}
+    }
+    return null;
+  }
+
+  private getDefaults(): MobileConfig {
+    return {
+      desktopHost: null,
+      desktopPort: 53210,
+      deviceId: this.getOrCreateDeviceId(),
+      deviceName: DEFAULT_DEVICE_NAME,
+      pairingSecret: null,
+      pairedDesktopId: null,
+      pairedDesktopName: null,
+      qualityPreset: 'Balanced',
+      autoUpload: false,
+      autoReturn: true,
+    };
+  }
+
+  private getOrCreateDeviceId(): string {
+    const existing = this.storage.getString('snapbridge.device_id');
+    if (existing) return existing;
+
+    // Generate a UUID-like identifier
+    const id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === 'x' ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+    this.storage.set('snapbridge.device_id', id);
+    return id;
+  }
+}
+
+
+// File: e:\SnapBridge\mobile\src\theme\index.ts
+export const Colors = {
+  primary: '#4F46E5',
+  primaryDark: '#3730A3',
+  primaryLight: '#818CF8',
+  background: '#0F172A',
+  surface: '#1E293B',
+  surfaceLight: '#334155',
+  text: '#F8FAFC',
+  textSecondary: '#94A3B8',
+  textMuted: '#64748B',
+  accent: '#22D3EE',
+  success: '#10B981',
+  warning: '#F59E0B',
+  error: '#EF4444',
+  border: '#475569',
+  white: '#FFFFFF',
+  black: '#000000',
+  transparent: 'transparent',
+} as const;
+
+export const Spacing = {
+  xs: 4,
+  sm: 8,
+  md: 16,
+  lg: 24,
+  xl: 32,
+  xxl: 48,
+} as const;
+
+export const FontSize = {
+  xs: 11,
+  sm: 13,
+  md: 15,
+  lg: 17,
+  xl: 20,
+  xxl: 24,
+  title: 28,
+} as const;
+
+export const BorderRadius = {
+  sm: 6,
+  md: 10,
+  lg: 16,
+  xl: 24,
+  full: 999,
+} as const;
+
+
+// File: e:\SnapBridge\mobile\src\types\declarations.d.ts
+declare module 'react-native-zeroconf' {
+  import { EventEmitter } from 'events';
+
+  export interface Service {
+    name: string;
+    host: string;
+    port: number;
+    addresses: string[];
+    txt?: Record<string, string>;
+  }
+
+  export default class Zeroconf extends EventEmitter {
+    constructor();
+    scan(type?: string, protocol?: string, domain?: string): void;
+    stop(): void;
+    on(event: 'start' | 'stop' | 'resolved' | 'error', callback: (data: any) => void): this;
+  }
+}
+
+
+// File: e:\SnapBridge\mobile\src\types\index.ts
+export interface MobileConfig {
+  desktopHost: string | null;
+  desktopPort: number;
+  deviceId: string;
+  deviceName: string;
+  pairingSecret: string | null;
+  pairedDesktopId: string | null;
+  pairedDesktopName: string | null;
+  qualityPreset: 'High' | 'Balanced' | 'Fast';
+  autoUpload: boolean;
+  autoReturn: boolean;
+}
+
+export interface DesktopTarget {
+  host: string;
+  port: number;
+  name: string;
+  uuid: string;
+}
+
+export interface CapturedImage {
+  uri: string;
+  width: number;
+  height: number;
+  mimeType: string;
+  fileSize: number;
+  fileName: string;
+}
+
+export interface UploadProgress {
+  correlationId: string;
+  bytesTotal: number;
+  bytesSent: number;
+  percent: number;
+  status: 'pending' | 'uploading' | 'success' | 'failed' | 'retrying';
+  error?: string;
+  attempt: number;
+  maxAttempts: number;
+}
+
+export interface QrPayload {
+  uuid: string;
+  secret: string;
+  service: string;
+  port: number;
+}
+
+

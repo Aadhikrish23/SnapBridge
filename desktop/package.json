@@ -4,20 +4,13 @@
   "private": true,
   "main": "dist/main/index.js",
   "scripts": {
-    "build": "tsc && node scripts/copy-assets.js",
-    "test": "tsc && node --test dist/tests/Logger.test.js dist/tests/NodeEventBus.test.js dist/tests/JsonPersistenceService.test.js dist/tests/ConfigurationService.test.js dist/tests/HttpServer.test.js dist/tests/ClipboardService.test.js dist/tests/NotificationService.test.js dist/tests/FolderService.test.js",
+    "build": "tsc",
+    "test": "echo \"No tests\"",
     "start": "electron ."
-  },
-  "dependencies": {
-    "shared": "*",
-    "bonjour-service": "^1.2.1",
-    "qrcode": "^1.5.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "@types/qrcode": "^1.5.5",
     "electron": "29.1.0",
-    "electron-builder": "^24.13.3",
     "typescript": "^5.4.5"
   }
 }

@@ -1,14 +1,19 @@
 {
-  "name": "snapbridge-monorepo",
+  "name": "snapbridge",
   "private": true,
   "workspaces": [
     "shared",
-    "desktop",
-    "mobile"
+    "desktop"
   ],
   "scripts": {
-    "shared:build": "npm run build -w shared",
-    "desktop:build": "npm run build -w desktop",
-    "mobile:start": "npm run start -w mobile"
+    "install:all": "npm install --workspaces",
+    "build": "npm run build -w desktop",
+    "build:shared": "npm run build -w shared",
+    "build:desktop": "npm run build -w desktop",
+    "desktop": "npm start -w desktop",
+    "clean": "npm cache verify"
+  },
+  "dependencies": {
+    "@babel/runtime": "^8.0.0"
   }
 }

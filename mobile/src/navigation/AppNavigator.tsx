@@ -5,7 +5,6 @@ import type { RootStackParamList } from './types';
 import { CameraScreen } from '../screens/CameraScreen';
 import { PreviewScreen } from '../screens/PreviewScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
-import { QrScannerScreen } from '../screens/QrScannerScreen';
 import { Colors } from '../theme';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -22,16 +21,7 @@ export function AppNavigator(): React.JSX.Element {
         }}>
         <Stack.Screen name="Camera" component={CameraScreen} />
         <Stack.Screen name="Preview" component={PreviewScreen} />
-        <Stack.Screen
-          name="Settings"
-          component={SettingsScreen}
-          options={{ animation: 'slide_from_bottom' }}
-        />
-        <Stack.Screen
-          name="QrScanner"
-          component={QrScannerScreen}
-          options={{ animation: 'slide_from_bottom' }}
-        />
+        <Stack.Screen name="Settings" component={SettingsScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );
